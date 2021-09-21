@@ -1,0 +1,15 @@
+{application, sox,
+ [{description, "async sctp sockets"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {mod, {sox_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache 2.0"]},
+  {links, []}
+ ]}.
