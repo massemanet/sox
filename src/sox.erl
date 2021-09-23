@@ -5,7 +5,8 @@
 -export(
    [start/1,
     command/3,
-    forward/2]).
+    forward/2,
+    info/0]).
 
 
 -define(SEPPUKU(X), error(#{where => where(?MODULE, ?FUNCTION_NAME, ?LINE), why => X})).
@@ -25,6 +26,9 @@ command(Instance, What, Args) ->
 forward(Instance, What) ->
     Instance ! {'$forward', What}.
 
+info() ->
+    sctp_info().
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%
 
@@ -37,7 +41,7 @@ validate(Opts) ->
 
 validate_server(Opts) ->
     #{name := _Name, local_ip := _IP, local_port := _Port} = Opts,
-    Opts#{state => down, connxns => []}.
+    Opts#{state => down, connxns => tnew()}.
 
 validate_client(Opts) ->
     #{name := _Name, local_ip := _LIP, local_port := _LPort,
@@ -55,18 +59,17 @@ setup(Opts) ->
     case maps:get(type, Opts) of
         connxn -> Opts;
         _ ->
-            #{name := Name, local_ip := IP, local_port := Port} = Opts,
-            true = register(Name, self()),
-            {ok, S} = socket:open(inet, stream, sctp),
-            ok = socket:bind(S, #{family => inet, addr => IP, port => Port}),
-            Opts#{socket => S, state => down}
+            true = register(maps:get(name, Opts), self()),
+            Opts#{socket => sctp_create(Opts), state => down}
     end.
 
 loop(State) ->
     receive
         {'$command', From, What, Args}   -> loop(handle_command(What, Args, From, State));
-        {'$forward', What}               -> loop(handle_forward(What, State));
-        {'$socket', Socket, select, Ref} -> loop(handle_select(Socket, Ref, State))
+        {'$send', What}                  -> loop(handle_send(What, State));
+        {'$socket', Socket, select, Ref} -> loop(handle_socket(Socket, Ref, State));
+        {'DOWN', _, process, Pid, I}     -> loop(handle_death(Pid, I, State))
+                                                
     end.
 
 handle_command(connect, Args, From, State)    -> do_connect(Args, From, State);
@@ -74,6 +77,35 @@ handle_command(disconnect, Args, From, State) -> do_disconnect(Args, From, State
 handle_command(listen, Args, From, State)     -> do_listen(Args, From ,State);
 handle_command(unlisten, Args, From, State)   -> do_unlisten(Args, From, State);
 handle_command(status, Args, From, State)     -> do_status(Args, From, State).
+
+handle_death(Pid, Info, State) ->
+    #{connxns := Connxns} = State,
+    nop(death, Info, State#{connxns => tdel(Pid, Connxns)}).
+
+handle_send(What, State) ->
+    case maps:get(type, State) of
+        server ->
+            Connxns = maps:get(connxns, State),
+            case tlen(Connxns) of
+                0 -> nop(send, drop, State);
+                N -> tget(rand:uniform(N), Connxns) ! What
+            end;
+        _ ->
+           case maps:get(send_buffer_full, State, false) of
+               true -> nop(send_fail, buffer_full, State);
+               false -> sctp_send(What, State)
+           end
+    end.
+
+handle_socket(Socket, Ref, State) ->
+    case Ref of
+        connect -> sctp_connect(triggered, State);
+        accept -> sctp_accept_loop(Socket, State);
+        send -> nop(socket, send_buffer_ok, State#{send_buffer_full => false});
+        recv -> sctp_recv_loop(State);
+        _ -> ?SEPPUKU(#{select_fail => Ref})
+    end.
+                    
 
 do_connect(Args, From, State) ->
     case maps:get(type, State) of
@@ -122,32 +154,55 @@ do_unlisten(Args, From, State) ->
 
 do_status(Args, From, State) ->
     case Args of
-        state ->
-            reply(State, From, State);
-        opts ->
-            reply(getopts(maps:get(socket, State)), From, State)
+        state -> reply(State, From, State);
+        info  -> reply(sctp_info(State), From, State);
+        opts  -> reply(sctp_getopts(State), From, State);
+        _     -> reply(unrec, From, State)
     end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% SCTP operations against `socket'
 
+sctp_create(State) ->
+    #{local_ip := LIP, localPort := LPort} = State,
+    {ok, Socket} = socket:open(inet, stream, sctp),
+    ok = socket:bind(Socket, #{family => inet, addr => LIP, port => LPort}),
+    State#{socket => Socket}.
+
+sctp_recreate(State) ->
+    ok = socket:close(maps:get(socket, State)),
+    sctp_create(State).
+
 sctp_listen(State) ->
     case maps:get(state, State) of
-        listening -> nop(listen, already_listening, State);
+        listening -> nop(listen, already, State);
         unlistening ->
             #{socket := Socket} = State,
             ok = socket:listen(Socket),
-            accept_loop(Socket, State)
+            sctp_accept_loop(Socket, State#{state => listening})
     end.
 
-accept_loop(Listen, State) ->
+sctp_accept_loop(Listen, State) ->
     case socket:accept(Listen, nowait) of
-        {ok, Connxn} -> accept_loop(Listen, update_val(connxns, {prepend, Connxn}, State));
+        {ok, Socket} -> sctp_accept_loop(Listen, create_connxn(Socket, State));
         {select, SelectInfo} -> State#{accept_ref => SelectInfo};
         {error, Reason} -> ?SEPPUKU(Reason)
     end.
 
-sctp_connect(State) ->
+create_connxn(Socket, State) ->
+    #{forward := Forward, connxns := Connxns} = State,
+    Opts = #{socket => Socket, type => connxn, forward => Forward},
+    Connxn = start(Opts),
+    State#{connxns => tput(Connxn, Connxns)}.
+
+sctp_unlisten(State) ->
+    case maps:get(state, State) of
+        unlistening -> nop(unlisten, already, State);
+        listening -> State#{state => unlistening, socket => sctp_recreate(State)}
+    end.
+
+
+sctp_connect(_Args, State) ->
     #{socket := Socket, timeout := _TO, remote_ip := RIP, remote_port := RPort} = State,
     case socket:connect(Socket, #{family => inet, addr => RIP, port => RPort}, nowait) of
         ok -> State#{state => connected};
@@ -155,32 +210,41 @@ sctp_connect(State) ->
         {error, Reason} -> ?SEPPUKU(Reason)
     end.
 
+sctp_cancel_connect(_Args, State) ->
+    case maps:get(State, connect_ref, undefined) of
+        undefined -> nop(cancel_connect, already, State);
+        Ref -> socket:cancel(maps:get(socket, State), Ref)
+    end.
+
 sctp_send(Payload, State) ->
-    case socket:sendmsg(Socket, #{iov=>[Payload]}, nowait) of
-        ok -> ;
-        {ok, RestData} -> ;
-        {select, SelectInfo} -> ;
-        {select, {SelectInfo, RestData}} -> ;
-        {error, Reason} -> ;
-        {error, {Reason, RestData}} ->
+    case socket:sendmsg(maps:get(socket, State), #{iov=>[Payload]}, nowait) of
+        ok                        -> State;
+        {ok, _}                   -> nop(send, broken_send, State);
+        {select, {SelectInfo, _}} -> nop(send, broken_send, State#{send_ref => SelectInfo});
+        {select, SelectInfo}      -> State#{send_ref => SelectInfo};
+        {error, Reason}           -> ?SEPPUKU(#{send_error => Reason})
     end.
 
-
-sctp_recv(S) ->
-    case socket:recvmsg(S, nowait) of
-        {ok,#{addr := #{addr := Addr,port := Port}, iov := [Msg]}} ->
-            {ok, #{from => {Addr, Port}, msg => Msg}};
-        {select, SelectInfo} -> ;
-        {select,{select_info, recvmsg, Handle}} -> ;
-        {error, Reason} ->
+sctp_recv_loop(State) ->
+    case socket:recvmsg(maps:get(socket, State), nowait) of
+        {ok, Msg}            -> do_forward(Msg, State);
+        {select, SelectInfo} -> State#{recv_ref => SelectInfo};
+        {error, Reason}      -> ?SEPPUKU(#{recv_fail => Reason})
     end.
 
-sctp_shutdown(State) ->
-    case socket:shutdown(Socket, write) of
+do_forward(Msg, State) ->
+    case maps:get(forward, State, undefined) of
+        undefined -> nop(forward, drop, State);
+        Dest ->
+            Dest ! Msg,
+            State
+    end.
+             
+sctp_shutdown(_Args, State) ->
+    case socket:shutdown(maps:get(socket, State), write) of
         ok -> State#{state => closing};
-        {error, Reason} ->
+        {error, Reason} -> ?SEPPUKU(#{shutdown_error => Reason})
     end.
-
 
 sctp_info() ->
     lists:map(fun sctp_info/1, socket:which_sockets(sctp)).
@@ -247,8 +311,28 @@ nop(Action, Args, State) ->
     ?LOG_INFO(#{action => Action, args => Args, state => State}),
     State.
 
-update_val(Key, {prepend, Val}, Map) ->
-    Map#{Key => [Val|maps:get(Key, Map)]}.
-
 where(M, F, L) ->
     atom_to_list(M)++":"++atom_to_list(F)++":"++integer_to_list(L).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% use a tuple as fast array
+
+tnew() ->
+    {0}.
+
+tlen(T) ->
+    element(1, T).
+
+tget(N, T) ->
+    element(N+1, T).
+
+tput(V, T) ->
+    [N|L] = tuple_to_list(T),
+    list_to_tuple([N+1, V|L]).
+
+tdel(V, T) ->
+    [N|L] = tuple_to_list(T),
+    case L--[V] of
+        L -> T;
+        O -> list_to_tuple([N-1|O])
+    end.

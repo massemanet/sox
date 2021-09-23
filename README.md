@@ -1,9 +1,4 @@
 sox
 =====
 
-async sctp sockets
-
-Build
------
-
-    $ rebar3 compile
+A small workbench to investigate async sctp sockets.
