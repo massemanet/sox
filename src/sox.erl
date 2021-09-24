@@ -5,8 +5,8 @@
 -export(
    [start/1,
     command/3,
-    forward/2,
-    info/0]).
+    send/2,
+    info/0, info/1]).
 
 
 -define(SEPPUKU(X), error(#{where => where(?MODULE, ?FUNCTION_NAME, ?LINE), why => X})).
@@ -18,16 +18,20 @@
 %% connected socket (which we get from `accept').
 
 start(Opts) ->
-    spawn(init(validate(Opts))).
+    State = validate(Opts),
+    spawn(fun() -> init(State) end).
 
 command(Instance, What, Args) ->
-    Instance ! {'$command', What, Args}.
+    request(Instance, What, Args).
 
-forward(Instance, What) ->
-    Instance ! {'$forward', What}.
+send(Instance, What) ->
+    Instance ! {'$send', What}.
 
 info() ->
     sctp_info().
+
+info(Instance) ->
+    command(Instance, status, info).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%
@@ -39,37 +43,45 @@ validate(Opts) ->
             #{type := connxn} -> validate_connxn(Opts)
         end.
 
+%% server has 2 states; `listening'/`unlistening'. It also has a set
+%% of `connxns'; if that set is empty the server is down.
 validate_server(Opts) ->
     #{name := _Name, local_ip := _IP, local_port := _Port} = Opts,
-    Opts#{state => down, connxns => tnew()}.
+    Opts#{state => unlistening, connxns => tnew(), forward => undefined}.
 
+%% a client has 4 states; `down', `connecting', `disconnecting', `up'.
 validate_client(Opts) ->
     #{name := _Name, local_ip := _LIP, local_port := _LPort,
       remote_ip := _RIP, remote_port := _RPort, timeout := _TO} = Opts,
-    Opts#{state => closed, timer => undefined}.
+    Opts#{state => closed, timer => undefined, forward => undefined}.
 
 validate_connxn(Opts) ->
     #{socket := _Socket} = Opts,
     Opts.
 
-init(Opts) ->
-    loop(setup(Opts)).
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% the endpoint process
 
-setup(Opts) ->
-    case maps:get(type, Opts) of
-        connxn -> Opts;
-        _ ->
-            true = register(maps:get(name, Opts), self()),
-            Opts#{socket => sctp_create(Opts), state => down}
+init(State) ->
+    loop(setup(State)).
+
+setup(State) ->
+    case State of
+        #{type := connxn} ->
+            sctp_recv_loop(State);
+        #{name := Name} ->
+            true = register(Name, self()),
+            sctp_create(State)
     end.
 
 loop(State) ->
     receive
         {'$command', From, What, Args}   -> loop(handle_command(What, Args, From, State));
+        {'$internal', What, Args}        -> loop(handle_internal(What, Args, State));
         {'$send', What}                  -> loop(handle_send(What, State));
         {'$socket', Socket, select, Ref} -> loop(handle_socket(Socket, Ref, State));
+        {'DOWN', _, socket, Socket, I}   -> loop(handle_death(Socket, I, State));
         {'DOWN', _, process, Pid, I}     -> loop(handle_death(Pid, I, State))
-                                                
     end.
 
 handle_command(connect, Args, From, State)    -> do_connect(Args, From, State);
@@ -78,9 +90,20 @@ handle_command(listen, Args, From, State)     -> do_listen(Args, From ,State);
 handle_command(unlisten, Args, From, State)   -> do_unlisten(Args, From, State);
 handle_command(status, Args, From, State)     -> do_status(Args, From, State).
 
-handle_death(Pid, Info, State) ->
+handle_death(Dead, Info, State) when tuple_size(Dead) =:= 2->
+    case nop(socket_fail, Info, State) of
+        #{type := client} -> internal(immediate, retry_connect, fail, State#{state => connecting});
+        #{type := server} -> ?SEPPUKU(#{listen_socket_fail => Info});
+        #{type := connxn} -> ?SEPPUKU(#{socket_died => Info})
+    end;
+handle_death(Dead, Info, State) when is_pid(Dead) ->
     #{connxns := Connxns} = State,
-    nop(death, Info, State#{connxns => tdel(Pid, Connxns)}).
+    nop(death, Info, State#{connxns => tdel(Dead, Connxns)}).
+
+handle_internal(What, Args, State) ->
+    case What of
+        retry_connect -> sctp_connect(Args, State)
+    end.
 
 handle_send(What, State) ->
     case maps:get(type, State) of
@@ -97,13 +120,17 @@ handle_send(What, State) ->
            end
     end.
 
+-define(CONNECT(Ref), {Ref, #{connect_ref := {select_info, connect, Ref}}}).
+-define(ACCEPT(Ref),  {Ref, #{accept_ref := {select_info, accept, Ref}}}).
+-define(SEND(Ref),    {Ref, #{send_ref := {select_info, sendmsg, Ref}}}).
+-define(RECV(Ref),    {Ref, #{recv_ref := {select_info, recvmsg, Ref}}}).
 handle_socket(Socket, Ref, State) ->
-    case Ref of
-        connect -> sctp_connect(triggered, State);
-        accept -> sctp_accept_loop(Socket, State);
-        send -> nop(socket, send_buffer_ok, State#{send_buffer_full => false});
-        recv -> sctp_recv_loop(State);
-        _ -> ?SEPPUKU(#{select_fail => Ref})
+    case {Ref, State} of
+        ?CONNECT(Ref) -> sctp_connect(triggered, State);
+        ?ACCEPT(Ref)  -> sctp_accept_loop(Socket, State);
+        ?SEND(Ref)    -> nop(socket, send_buffer_ok, State#{send_buffer_full => false});
+        ?RECV(Ref)    -> sctp_recv_loop(State);
+        _             -> ?SEPPUKU(#{select_fail => Ref, state => State})
     end.
                     
 
@@ -164,7 +191,7 @@ do_status(Args, From, State) ->
 %% SCTP operations against `socket'
 
 sctp_create(State) ->
-    #{local_ip := LIP, localPort := LPort} = State,
+    #{local_ip := LIP, local_port := LPort} = State,
     {ok, Socket} = socket:open(inet, stream, sctp),
     ok = socket:bind(Socket, #{family => inet, addr => LIP, port => LPort}),
     State#{socket => Socket}.
@@ -184,15 +211,16 @@ sctp_listen(State) ->
 
 sctp_accept_loop(Listen, State) ->
     case socket:accept(Listen, nowait) of
-        {ok, Socket} -> sctp_accept_loop(Listen, create_connxn(Socket, State));
+        {ok, Socket}         -> sctp_accept_loop(Listen, create_connxn(Socket, State));
         {select, SelectInfo} -> State#{accept_ref => SelectInfo};
-        {error, Reason} -> ?SEPPUKU(Reason)
+        {error, Reason}      -> ?SEPPUKU(Reason)
     end.
 
 create_connxn(Socket, State) ->
     #{forward := Forward, connxns := Connxns} = State,
     Opts = #{socket => Socket, type => connxn, forward => Forward},
     Connxn = start(Opts),
+    monitor(process, Connxn),
     State#{connxns => tput(Connxn, Connxns)}.
 
 sctp_unlisten(State) ->
@@ -202,12 +230,16 @@ sctp_unlisten(State) ->
     end.
 
 
-sctp_connect(_Args, State) ->
-    #{socket := Socket, timeout := _TO, remote_ip := RIP, remote_port := RPort} = State,
+sctp_connect(Args, State) ->
+    #{socket := Socket, remote_ip := RIP, remote_port := RPort} = State,
     case socket:connect(Socket, #{family => inet, addr => RIP, port => RPort}, nowait) of
-        ok -> State#{state => connected};
-        {select, SelectInfo} -> State#{state => connecting, connect_ref => SelectInfo};
-        {error, Reason} -> ?SEPPUKU(Reason)
+        ok ->
+            sctp_recv_loop(State#{state => connected, connect_ref => undefined, timer => undefined});
+        {select, SelectInfo} ->
+            State#{state => connecting, connect_ref => SelectInfo};
+        {error, Reason} ->
+            S = nop(connect_fail, Reason, State#{connect_ref => undefined}),
+            internal(delayed, retry_connect, Args, S)
     end.
 
 sctp_cancel_connect(_Args, State) ->
@@ -218,8 +250,8 @@ sctp_cancel_connect(_Args, State) ->
 
 sctp_send(Payload, State) ->
     case socket:sendmsg(maps:get(socket, State), #{iov=>[Payload]}, nowait) of
-        ok                        -> State;
-        {ok, _}                   -> nop(send, broken_send, State);
+        ok                        -> State#{send_ref => undefined};
+        {ok, _}                   -> nop(send, broken_send, State#{send_ref => undefined});
         {select, {SelectInfo, _}} -> nop(send, broken_send, State#{send_ref => SelectInfo});
         {select, SelectInfo}      -> State#{send_ref => SelectInfo};
         {error, Reason}           -> ?SEPPUKU(#{send_error => Reason})
@@ -227,17 +259,15 @@ sctp_send(Payload, State) ->
 
 sctp_recv_loop(State) ->
     case socket:recvmsg(maps:get(socket, State), nowait) of
-        {ok, Msg}            -> do_forward(Msg, State);
+        {ok, Msg}            -> sctp_recv_loop(do_forward(Msg, State));
         {select, SelectInfo} -> State#{recv_ref => SelectInfo};
-        {error, Reason}      -> ?SEPPUKU(#{recv_fail => Reason})
+        {error, Reason}      -> nop(recv_fail, Reason, State#{recv_ref => undefined})
     end.
 
 do_forward(Msg, State) ->
-    case maps:get(forward, State, undefined) of
-        undefined -> nop(forward, drop, State);
-        Dest ->
-            Dest ! Msg,
-            State
+    case State of
+        #{forward := undefined} -> nop(forward, drop, State);
+        #{forward := Dest}-> Dest ! Msg, State
     end.
              
 sctp_shutdown(_Args, State) ->
@@ -249,8 +279,10 @@ sctp_shutdown(_Args, State) ->
 sctp_info() ->
     lists:map(fun sctp_info/1, socket:which_sockets(sctp)).
 
-sctp_info(State) ->
-    socket:info(maps:get(socket, State)).
+sctp_info(#{socket := Socket}) ->
+    sctp_info(Socket);
+sctp_info(Socket) ->
+    socket:info(Socket).
 
 sctp_getopts(State) ->
     lists:foldl(mk_sctp_getopt(State), [], opts()).
@@ -300,8 +332,31 @@ opts() ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% Utilities
 
-reply(Reply, From, State) ->
-    From ! Reply,
+%% we send commands to an EP with request/reply.
+%% `request' runs in the calling process
+request(undefined, _What, _Args) ->
+    {error, dead};
+request(Instance, What, Args) when is_atom(Instance) ->
+    request(whereis(Instance), What, Args);
+request(Instance, What, Args) when is_pid(Instance) ->
+    Ref = erlang:monitor(process, Instance),
+    Instance ! {'$command', {self(), Ref}, What, Args},
+    receive
+        {'DOWN', Ref, _, _, Info} -> {error, Info};
+        {reply, Ref, Reply} -> Reply
+    end.
+
+internal(immediate, What, Args, State) ->
+    self() ! {'$internal', What, Args},
+    State;
+internal(delayed, What, Args, State) ->
+    TO = maps:get(timeout, State, 0),
+    Timer = erlang:send_after(TO, self(), {'$internal', What, Args}),
+    State#{timer => Timer}.
+
+%% `reply' runs in the EP process
+reply(Reply, {Pid, Ref}, State) ->
+    Pid ! {reply, Ref, Reply},
     State.
 
 nop(State) ->
